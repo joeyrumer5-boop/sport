@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+databases
+pandas
+nfl-data-py
+python-dotenv
+aiofiles
+python-multipart
+requests
+pydantic

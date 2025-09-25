@@ -1,0 +1,318 @@
+# main.py
+import os
+import asyncio
+from fastapi import FastAPI, HTTPException, Request, Form
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+import sqlalchemy
+from sqlalchemy import MetaData, Table, Column, Integer, String, Date, Float, Boolean, UniqueConstraint, select, func
+from sqlalchemy import create_engine
+import pandas as pd
+import nfl_data_py as nfl
+from datetime import datetime
+import uvicorn
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(PROJECT_DIR, "nfl_stats.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+metadata = MetaData()
+
+# Tables
+players = Table(
+    "players",
+    metadata,
+    Column("player_id", String, primary_key=True),
+    Column("player_name", String),
+    Column("position", String),
+    Column("team", String)
+)
+
+player_game_stats = Table(
+    "player_game_stats",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("player_id", String, nullable=False),
+    Column("player_name", String, nullable=False),
+    Column("team", String),
+    Column("opponent", String),
+    Column("season", Integer),
+    Column("week", Integer),
+    Column("game_date", Date),
+    Column("home", Boolean),
+    Column("position", String),
+    Column("passing_cmp", Integer, default=0),
+    Column("passing_att", Integer, default=0),
+    Column("passing_yds", Integer, default=0),
+    Column("passing_tds", Integer, default=0),
+    Column("passing_ints", Integer, default=0),
+    Column("sacks", Integer, default=0),
+    Column("rushing_att", Integer, default=0),
+    Column("rushing_yds", Integer, default=0),
+    Column("rushing_tds", Integer, default=0),
+    Column("receiving_rec", Integer, default=0),
+    Column("receiving_tgt", Integer, default=0),
+    Column("receiving_yds", Integer, default=0),
+    Column("receiving_tds", Integer, default=0),
+    Column("fumbles", Integer, default=0),
+    Column("fantasy_pts", Float, default=0.0),
+    UniqueConstraint("player_id", "season", "week", "team", name="u_player_season_week_team")
+)
+
+metadata.create_all(engine)
+
+app = FastAPI(title="NFL Matchup Stats (2024+2025)")
+
+# Serve static frontend
+app.mount("/static", StaticFiles(directory=os.path.join(PROJECT_DIR, "static")), name="static")
+
+# CORS so frontend hosted on same project can call it
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def safe_int(x):
+    try:
+        if pd.isna(x):
+            return 0
+        return int(x)
+    except:
+        try:
+            return int(float(x))
+        except:
+            return 0
+
+def normalize_row(row):
+    def get(*names):
+        for n in names:
+            if n in row and not pd.isna(row[n]):
+                return row[n]
+        return None
+
+    player_id = str(get("gsis_id", "player_id", "nfl_id", "player_key") or get("player") or "")
+    player_name = get("full_name", "player_display_name", "player") or ""
+    team = get("team") or ""
+    opp = get("opp") or get("opponent") or ""
+    season = safe_int(get("season", "season_x", "year"))
+    week = safe_int(get("week"))
+    game_date = get("game_date") or get("date")
+    if game_date:
+        try:
+            game_date = pd.to_datetime(game_date).date()
+        except:
+            game_date = None
+    pos = get("position", "pos")
+    passing_cmp = safe_int(get("pass_cmp", "passing_cmp", "cmp"))
+    passing_att = safe_int(get("pass_att", "passing_att", "att"))
+    passing_yds = safe_int(get("pass_yds", "passing_yds", "yds"))
+    passing_tds = safe_int(get("pass_tds", "passing_tds", "pass_td"))
+    passing_ints = safe_int(get("pass_int", "passing_int", "int"))
+    sacks = safe_int(get("sacks", "sk"))
+
+    rushing_att = safe_int(get("rush_att", "rushing_att"))
+    rushing_yds = safe_int(get("rush_yds", "rushing_yds", "rush_yds"))
+    rushing_tds = safe_int(get("rush_td", "rushing_tds"))
+    receiving_rec = safe_int(get("rec", "receiving_rec", "receptions"))
+    receiving_tgt = safe_int(get("targets", "receiving_tgt"))
+    receiving_yds = safe_int(get("rec_yds", "receiving_yds", "yds_rec", "yds"))
+    receiving_tds = safe_int(get("rec_td", "receiving_tds"))
+    fumbles = safe_int(get("fumbles", "fumbles_lost", "fum"))
+    fantasy_pts = float(get("fantasy_points", "fantasy_pts") or 0.0)
+
+    home = None
+    try:
+        home_flag = get("home")
+        if isinstance(home_flag, (int,bool)):
+            home = bool(home_flag)
+    except:
+        home = None
+
+    return {
+        "player_id": player_id,
+        "player_name": player_name,
+        "team": team,
+        "opponent": opp,
+        "season": season,
+        "week": week,
+        "game_date": game_date,
+        "home": home,
+        "position": pos,
+        "passing_cmp": passing_cmp,
+        "passing_att": passing_att,
+        "passing_yds": passing_yds,
+        "passing_tds": passing_tds,
+        "passing_ints": passing_ints,
+        "sacks": sacks,
+        "rushing_att": rushing_att,
+        "rushing_yds": rushing_yds,
+        "rushing_tds": rushing_tds,
+        "receiving_rec": receiving_rec,
+        "receiving_tgt": receiving_tgt,
+        "receiving_yds": receiving_yds,
+        "receiving_tds": receiving_tds,
+        "fumbles": fumbles,
+        "fantasy_pts": fantasy_pts
+    }
+
+@app.post("/ingest")
+async def ingest_endpoint():
+    """Trigger ingestion for seasons 2024 and 2025. Returns status when done."""
+    seasons = [2024, 2025]
+    # Run ingestion synchronously (may take a few minutes depending on connection)
+    try:
+        for s in seasons:
+            await asyncio.get_event_loop().run_in_executor(None, ingest_season, s)
+        return {"status": "ok", "message": f"Ingested seasons: {seasons}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def ingest_season(season):
+    print(f"[ingest] fetching weekly data for season {season} ...")
+    df = nfl.import_weekly_data([season])
+    print(f"[ingest] fetched {len(df)} rows for season {season}")
+    conn = engine.connect()
+    trans = conn.begin()
+    try:
+        for idx, row in df.iterrows():
+            r = normalize_row(row)
+            # simple dedupe: delete previous same (player_id, season, week, team)
+            try:
+                del_stmt = player_game_stats.delete().where(
+                    (player_game_stats.c.player_id == r["player_id"]) &
+                    (player_game_stats.c.season == r["season"]) &
+                    (player_game_stats.c.week == r["week"]) &
+                    (player_game_stats.c.team == r["team"])
+                )
+                conn.execute(del_stmt)
+            except Exception:
+                pass
+            ins = player_game_stats.insert().values(**r)
+            conn.execute(ins)
+            # upsert players table (insert or replace)
+            try:
+                # SQLite-specific UPSERT using insert or replace
+                conn.execute(
+                    players.insert().prefix_with("OR REPLACE").values(
+                        player_id=r["player_id"],
+                        player_name=r["player_name"],
+                        position=r["position"],
+                        team=r["team"]
+                    )
+                )
+            except Exception:
+                try:
+                    conn.execute(players.insert().values(
+                        player_id=r["player_id"],
+                        player_name=r["player_name"],
+                        position=r["position"],
+                        team=r["team"]
+                    ))
+                except Exception:
+                    pass
+        trans.commit()
+    except Exception as e:
+        trans.rollback()
+        raise
+    finally:
+        conn.close()
+    print(f"[ingest] season {season} finished.")
+
+@app.get("/players/search")
+async def search_players(q: str):
+    # case-insensitive search on player_name
+    like = f"%{q}%"
+    stmt = select(players.c.player_id, players.c.player_name, players.c.position, players.c.team).where(
+        players.c.player_name.ilike(like)
+    ).limit(50)
+    with engine.connect() as conn:
+        rows = conn.execute(stmt).fetchall()
+    return [{"player_id": r[0], "player_name": r[1], "position": r[2], "team": r[3]} for r in rows]
+
+@app.get("/players/{player_id}/gamelog")
+async def player_gamelog(player_id: str, season_from: int = None, season_to: int = None):
+    season_from = season_from or 0
+    season_to = season_to or 9999
+    stmt = select(player_game_stats).where(
+        (player_game_stats.c.player_id == player_id) &
+        (player_game_stats.c.season >= season_from) &
+        (player_game_stats.c.season <= season_to)
+    ).order_by(player_game_stats.c.season.desc(), player_game_stats.c.week.desc()).limit(500)
+    with engine.connect() as conn:
+        rows = conn.execute(stmt).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="No gamelog found")
+    out = []
+    for r in rows:
+        d = dict(r)
+        # convert date to iso
+        if isinstance(d.get("game_date"), (datetime, )):
+            d["game_date"] = d["game_date"].isoformat()
+        out.append(d)
+    return out
+
+@app.get("/players/{player_id}/by-opponent")
+async def player_by_opponent(player_id: str, season_from: int = None, season_to: int = None, min_games: int = 1):
+    season_from = season_from or 0
+    season_to = season_to or 9999
+    stmt = select(
+        player_game_stats.c.opponent.label("opponent"),
+        func.count().label("games"),
+        func.sum(player_game_stats.c.passing_yds).label("total_passing"),
+        func.avg(player_game_stats.c.passing_yds).label("avg_passing"),
+        func.sum(player_game_stats.c.passing_tds).label("total_pass_tds"),
+        func.sum(player_game_stats.c.passing_ints).label("total_ints"),
+        func.sum(player_game_stats.c.rushing_yds).label("total_rushing"),
+        func.avg(player_game_stats.c.rushing_yds).label("avg_rushing"),
+        func.sum(player_game_stats.c.rushing_tds).label("total_rush_tds"),
+        func.sum(player_game_stats.c.receiving_yds).label("total_receiving"),
+        func.avg(player_game_stats.c.receiving_yds).label("avg_receiving"),
+        func.sum(player_game_stats.c.receiving_tds).label("total_rec_tds"),
+        func.sum(player_game_stats.c.receiving_rec).label("total_receptions"),
+        func.avg(player_game_stats.c.receiving_rec).label("avg_receptions"),
+        func.sum(player_game_stats.c.fumbles).label("total_fumbles"),
+        func.avg(player_game_stats.c.fantasy_pts).label("avg_fantasy"),
+    ).where(
+        (player_game_stats.c.player_id == player_id) &
+        (player_game_stats.c.season >= season_from) &
+        (player_game_stats.c.season <= season_to)
+    ).group_by(player_game_stats.c.opponent).having(func.count() >= min_games).order_by(sqlalchemy.desc("games"))
+    with engine.connect() as conn:
+        rows = conn.execute(stmt).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="No aggregated data found")
+    out = []
+    for r in rows:
+        out.append({
+            "opponent": r[0],
+            "games": int(r[1]),
+            "total_passing": int(r[2] or 0),
+            "avg_passing": float(r[3] or 0.0),
+            "total_pass_tds": int(r[4] or 0),
+            "total_ints": int(r[5] or 0),
+            "total_rushing": int(r[6] or 0),
+            "avg_rushing": float(r[7] or 0.0),
+            "total_rush_tds": int(r[8] or 0),
+            "total_receiving": int(r[9] or 0),
+            "avg_receiving": float(r[10] or 0.0),
+            "total_rec_tds": int(r[11] or 0),
+            "total_receptions": int(r[12] or 0),
+            "avg_receptions": float(r[13] or 0.0),
+            "total_fumbles": int(r[14] or 0),
+            "avg_fantasy": float(r[15] or 0.0)
+        })
+    return out
+
+# Serve the frontend index
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    path = os.path.join(PROJECT_DIR, "static", "index.html")
+    return FileResponse(path)
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

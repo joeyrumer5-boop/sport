@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>NFL Matchup Stats (2024+2025)</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; padding: 18px; max-width: 1000px; margin: auto; }
+    input { padding: 8px; font-size: 14px; }
+    button { padding: 8px 12px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f7f7f7; }
+    .row { margin-top: 12px; }
+    ul { list-style:none; padding-left:0; }
+    li { margin-bottom:6px; }
+  </style>
+</head>
+<body>
+  <h1>NFL Matchup Stats (2024 + 2025)</h1>
+  <p>Use the search to find a player, then click to load per-opponent aggregates & game logs.</p>
+
+  <div>
+    <strong>Ingest / Update DB</strong>
+    <p>Click to pull 2024 & 2025 data (first run may take 2–8 minutes depending on data and network).</p>
+    <button id="ingestBtn">Ingest 2024 + 2025</button>
+    <span id="ingestStatus"></span>
+  </div>
+
+  <hr>
+
+  <div>
+    <input id="searchInput" placeholder="Search player name (type at least 2 chars)" style="width:420px" />
+    <div id="searchResults"></div>
+  </div>
+
+  <div id="playerSection" style="display:none; margin-top:18px;">
+    <h2 id="playerTitle"></h2>
+    <h3>Per-opponent aggregates</h3>
+    <div id="opponentTable"></div>
+
+    <h3>Recent game log</h3>
+    <div id="gamelogTable"></div>
+  </div>
+
+<script>
+const API_BASE = "";
+
+document.getElementById("ingestBtn").addEventListener("click", async () => {
+  const status = document.getElementById("ingestStatus");
+  status.innerText = " — running ingest... (may take a few minutes)";
+  try {
+    const r = await fetch("/ingest", { method: "POST" });
+    const j = await r.json();
+    status.innerText = " — Done: " + (j.message || JSON.stringify(j));
+  } catch (e) {
+    status.innerText = " — Error: " + e.toString();
+  }
+});
+
+let timeout = null;
+document.getElementById("searchInput").addEventListener("input", (e) => {
+  const q = e.target.value.trim();
+  if (q.length < 2) {
+    document.getElementById("searchResults").innerHTML = "";
+    return;
+  }
+  if (timeout) clearTimeout(timeout);
+  timeout = setTimeout(() => runSearch(q), 250);
+});
+
+async function runSearch(q) {
+  const container = document.getElementById("searchResults");
+  container.innerHTML = "Searching...";
+  try {
+    const res = await fetch(`/players/search?q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+    if (!data || data.length === 0) {
+      container.innerHTML = "No players found.";
+      return;
+    }
+    const ul = document.createElement("ul");
+    data.forEach(p => {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.innerText = `${p.player_name} ${p.position ? '('+p.position+')' : ''} ${p.team ? '- '+p.team : ''}`;
+      btn.onclick = () => loadPlayer(p);
+      li.appendChild(btn);
+      ul.appendChild(li);
+    });
+    container.innerHTML = "";
+    container.appendChild(ul);
+  } catch (e) {
+    container.innerHTML = "Search error: " + e.toString();
+  }
+}
+
+async function loadPlayer(p) {
+  document.getElementById("playerSection").style.display = "block";
+  document.getElementById("playerTitle").innerText = `${p.player_name} — ${p.position || ''} ${p.team ? '('+p.team+')' : ''}`;
+  // opponents
+  document.getElementById("opponentTable").innerText = "Loading...";
+  try {
+    const op = await fetch(`/players/${encodeURIComponent(p.player_id)}/by-opponent`);
+    const opd = await op.json();
+    if (!opd || opd.length === 0) {
+      document.getElementById("opponentTable").innerText = "No opponent data.";
+    } else {
+      const table = buildOppTable(opd);
+      document.getElementById("opponentTable").innerHTML = "";
+      document.getElementById("opponentTable").appendChild(table);
+    }
+  } catch (e) {
+    document.getElementById("opponentTable").innerText = "Error loading opponents: " + e.toString();
+  }
+  // gamelog
+  document.getElementById("gamelogTable").innerText = "Loading...";
+  try {
+    const g = await fetch(`/players/${encodeURIComponent(p.player_id)}/gamelog?season_from=2024&season_to=2025`);
+    const gd = await g.json();
+    if (!gd || gd.length === 0) {
+      document.getElementById("gamelogTable").innerText = "No gamelog.";
+    } else {
+      const table = buildGamelogTable(gd);
+      document.getElementById("gamelogTable").innerHTML = "";
+      document.getElementById("gamelogTable").appendChild(table);
+    }
+  } catch (e) {
+    document.getElementById("gamelogTable").innerText = "Error loading gamelog: " + e.toString();
+  }
+}
+
+function buildOppTable(rows) {
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>Opponent</th><th>Games</th><th>Avg Pass</th><th>Total Pass</th><th>Avg Rush</th><th>Total Rush</th><th>Avg Rec</th><th>Total Rec</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  rows.forEach(r => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.opponent}</td><td>${r.games}</td><td>${(r.avg_passing||0).toFixed(1)}</td><td>${r.total_passing}</td><td>${(r.avg_rushing||0).toFixed(1)}</td><td>${r.total_rushing}</td><td>${(r.avg_receiving||0).toFixed(1)}</td><td>${r.total_receiving}</td>`;
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  return table;
+}
+
+function buildGamelogTable(rows) {
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>Date</th><th>Season</th><th>Week</th><th>Opp</th><th>Pass Yds</th><th>Rush Yds</th><th>Rec Yds</th><th>Fantasy</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  rows.forEach(g => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${g.game_date||''}</td><td>${g.season||''}</td><td>${g.week||''}</td><td>${g.opponent||''}</td><td>${g.passing_yds||0}</td><td>${g.rushing_yds||0}</td><td>${g.receiving_yds||0}</td><td>${g.fantasy_pts||0}</td>`;
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  return table;
+}
+</script>
+</body>
+</html>
